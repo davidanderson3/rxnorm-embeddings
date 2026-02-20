@@ -73,32 +73,6 @@ http://127.0.0.1:8000
 
 The page now runs inference in-browser via Pyodide (no `/api/infer` call needed).
 
-## GitHub Pages deployment
-
-This repo now includes a static entrypoint (`index.html`) that redirects to `web/index.html`, so it can run on GitHub Pages.
-
-Required files in your published branch:
-
-- `web/index.html`
-- `web/app.js`
-- `rxnorm_mvp.py`
-- `artifacts/rxnorm_mvp/rxnorm_index.sqlite`
-- `artifacts/rxnorm_mvp/concept_embeddings.npy`
-- `artifacts/rxnorm_mvp/concept_rxcuis.json`
-
-Then:
-
-1. Enable GitHub Pages from the repository root.
-2. Open the Pages URL.
-3. Click **Run Mapping**.
-
-Notes:
-
-- First run downloads Pyodide + model artifacts (large: roughly 180 MB+ with current full index).
-- If you want a lighter site, build and publish a smaller smoke index.
-- `artifacts/` is ignored by default in `.gitignore`; if you publish from this repo, force-add the needed files (for example: `git add -f artifacts/rxnorm_mvp/*.sqlite artifacts/rxnorm_mvp/*.npy artifacts/rxnorm_mvp/*.json`).
-- You can override asset locations by setting `window.RXNORM_WEB_CONFIG` in `web/index.html` before loading `web/app.js`.
-
 ## Quick smoke test (small subset)
 
 Use these flags to test quickly before full indexing:
