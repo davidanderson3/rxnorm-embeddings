@@ -38,6 +38,7 @@ RATIO_STRENGTH_RE = re.compile(
 )
 SINGLE_STRENGTH_RE = re.compile(r"\b(\d+(?:\.\d+)?)\s*(mg|mcg|g|ml|units?|meq|%)\b")
 SLASH_RATIO_RE = re.compile(r"\b(\d+(?:\.\d+)?)\s*/\s*(\d+(?:\.\d+)?)\b")
+BARE_NUMBER_RE = re.compile(r"\b\d+(?:\.\d+)?\b")
 
 CONTEXT_STOPWORDS: Set[str] = {
     "po",
@@ -98,6 +99,10 @@ NOISY_TOKEN_REPLACEMENTS: Dict[str, str] = {
     "asa": "aspirin",
     "apap": "acetaminophen",
     "oxyapap": "acetaminophen oxycodone",
+    "pred": "prednisone",
+    "traz": "trazodone",
+    "glipzide": "glipizide",
+    "inslin": "insulin",
 }
 
 FORM_HINTS: Dict[str, Tuple[str, ...]] = {
@@ -107,14 +112,16 @@ FORM_HINTS: Dict[str, Tuple[str, ...]] = {
     "capsule": ("capsule", "cap"),
     "solution": ("solution", "soln"),
     "suspension": ("suspension",),
-    "injection": ("inject", "intravenous", "subcutaneous", "intramuscular"),
+    "injection": ("inject", "injection", "intravenous", "subcutaneous", "intramuscular"),
+    "dr": ("delayed release", "dr"),
+    "xl24": ("xl", "24 hr"),
     "cream": ("cream",),
     "ointment": ("ointment",),
     "patch": ("patch",),
     "nasal": ("nasal",),
     "ophthalmic": ("ophthalmic", "eye"),
     "otologic": ("otic", "ear"),
-    "er": ("extended release", "er", "xr", "24 hr"),
+    "er": ("extended release", "er", "xr", "xl", "sr", "24 hr", "12 hr"),
     "ec": ("enteric", "ec"),
 }
 
@@ -151,6 +158,7 @@ SEGMENT_SPLIT_PATTERNS: Tuple[str, ...] = (
     r"!",
     r";",
     r":",
+    r"\+",
     r"\bbut\b",
     r"\bplus\b",
 )
@@ -1206,12 +1214,32 @@ def extract_mention_features(
             continue
         ratio_pairs.append((first_val, second_val))
 
+    numeric_strength_values: List[float] = []
+    for raw in BARE_NUMBER_RE.findall(context_norm):
+        try:
+            numeric = float(raw)
+        except ValueError:
+            continue
+        if numeric <= 0.0 or numeric > 1500.0:
+            continue
+        numeric_strength_values.append(numeric)
+    numeric_strength_values = sorted({round(v, 6) for v in numeric_strength_values})
+
+    schedule_hint = bool(
+        re.search(
+            r"\b(?:daily|qd|qam|qhs|bid|tid|qid|nightly|weekly|monthly|q\d+h)\b",
+            context_norm,
+        )
+    )
+
     return {
         "strength_tokens": strength_tokens,
         "strength_sigs": strength_sigs,
         "form_tokens": form_tokens,
         "combo_hint": combo_hint,
         "ratio_pairs": ratio_pairs,
+        "numeric_strength_values": numeric_strength_values,
+        "schedule_hint": schedule_hint,
     }
 
 
@@ -1253,8 +1281,11 @@ def is_negated_mention(
         rf"stopped|discontinue|discontinued|allergic to|allergy to)\b"
         rf"(?:\s+\w+){{0,8}}\s+\b{anchor}\b"
     )
-    if re.search(neg_pattern, clause_norm):
-        return True
+    neg_match = re.search(neg_pattern, clause_norm)
+    if neg_match:
+        neg_span = clause_norm[neg_match.start() : neg_match.end()]
+        if not re.search(r"\b(?:but|however|though|although|except)\b", neg_span):
+            return True
 
     post_neg_pattern = rf"\b{anchor}\b(?:\s+\w+){{0,6}}\s+\b(?:held|stopped|discontinued)\b"
     return bool(re.search(post_neg_pattern, clause_norm))
@@ -1390,6 +1421,8 @@ def score_tty_candidate(
     candidate_ingredients: Set[str],
 ) -> float:
     candidate_norm = normalize_text(candidate_name)
+    candidate_flags = candidate_form_flags(candidate_norm)
+    candidate_strengths_mg = extract_candidate_strengths_mg(candidate_name)
     lexical = token_jaccard(mention_norm, candidate_norm)
     score = 1.8 * lexical
     score -= 0.45 * float(depth)
@@ -1397,6 +1430,8 @@ def score_tty_candidate(
     strength_tokens = mention_features["strength_tokens"]  # type: ignore[assignment]
     strength_sigs = mention_features["strength_sigs"]  # type: ignore[assignment]
     ratio_pairs = mention_features.get("ratio_pairs", [])
+    numeric_strength_values = mention_features.get("numeric_strength_values", [])
+    schedule_hint = bool(mention_features.get("schedule_hint", False))
     form_tokens = mention_features["form_tokens"]  # type: ignore[assignment]
     combo_hint = bool(mention_features["combo_hint"])
 
@@ -1419,7 +1454,6 @@ def score_tty_candidate(
             score -= 0.8
 
     if isinstance(ratio_pairs, list) and ratio_pairs:
-        candidate_strengths_mg = extract_candidate_strengths_mg(candidate_name)
         matched_ratio = False
         if len(candidate_strengths_mg) >= 2:
             for first_val, second_val in ratio_pairs:
@@ -1439,8 +1473,19 @@ def score_tty_candidate(
         elif len(candidate_strengths_mg) >= 2:
             score -= 1.3
 
+    if isinstance(numeric_strength_values, list) and numeric_strength_values and candidate_strengths_mg:
+        numeric_matches = 0
+        for expected in numeric_strength_values:
+            if contains_close_value(candidate_strengths_mg, expected):
+                numeric_matches += 1
+        if numeric_matches > 0:
+            score += 1.25 * float(min(numeric_matches, 2))
+        elif not (
+            isinstance(ratio_pairs, list) and ratio_pairs
+        ):
+            score -= 0.4
+
     if isinstance(form_tokens, set) and form_tokens:
-        candidate_flags = candidate_form_flags(candidate_norm)
         matched_form = 0
         for form_key in form_tokens:
             if form_key in candidate_flags:
@@ -1477,17 +1522,29 @@ def score_tty_candidate(
         if ("tablet" in form_tokens or "capsule" in form_tokens) and "inhaler" in candidate_flags:
             score -= 2.0
 
+    if schedule_hint and "injection" in candidate_flags and not (
+        isinstance(form_tokens, set) and "injection" in form_tokens
+    ):
+        score -= 2.4
+    if schedule_hint and any(
+        form in candidate_flags for form in {"oral", "tablet", "capsule", "dr", "er"}
+    ):
+        score += 0.6
+
     if "dry powder" in candidate_norm and not (
         isinstance(form_tokens, set) and "dry_powder" in form_tokens
     ):
         score -= 1.8
 
-    candidate_flags = candidate_form_flags(candidate_norm)
     if "solution" in candidate_flags and not (
         isinstance(form_tokens, set)
         and any(form in form_tokens for form in {"solution", "inhaler", "injection"})
     ):
         score -= 0.9
+    if " granules " in f" {candidate_norm} " and not (
+        isinstance(form_tokens, set) and "suspension" in form_tokens
+    ):
+        score -= 0.8
 
     combo_allowed = combo_hint or len(anchor_ingredients) > 1
     if target_tty == "MIN" and not combo_allowed:
@@ -1597,6 +1654,16 @@ def project_ttys(
             "name": best_name,
             "depth": best_depth,
         }
+
+    if projected["IN"] is None and len(anchor_ingredients) == 1:
+        inferred_in_rxcui = next(iter(anchor_ingredients))
+        inferred_in_name = concept_ttys.get(inferred_in_rxcui, {}).get("IN")
+        if inferred_in_name:
+            projected["IN"] = {
+                "rxcui": inferred_in_rxcui,
+                "name": inferred_in_name,
+                "depth": 0,
+            }
 
     return projected
 
