@@ -74,6 +74,12 @@ http://127.0.0.1:8000
 
 The page now runs inference in-browser via Pyodide (no `/api/infer` call needed).
 
+GitHub Pages URL:
+
+```txt
+https://davidanderson3.github.io/rxnorm-embeddings/web/index.html
+```
+
 ## Quick smoke test (small subset)
 
 Use these flags to test quickly before full indexing:

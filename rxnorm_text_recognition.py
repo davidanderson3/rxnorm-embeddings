@@ -32,13 +32,51 @@ TARGET_TTYS: Tuple[str, ...] = (
 
 TTY_PRIORITY: Dict[str, int] = {tty: i for i, tty in enumerate(TARGET_TTYS)}
 TOKEN_RE = re.compile(r"[A-Za-z0-9]+(?:[+/%_-][A-Za-z0-9]+)*(?:\.[A-Za-z0-9]+)*")
-STRENGTH_RE = re.compile(r"\b\d+(?:\.\d+)?\s*(?:mg|mcg|g|ml|units?|meq|%)\b")
+STRENGTH_RE = re.compile(
+    r"\b\d+(?:\.\d+)?\s*(?:mg|mcg|g|ml|units?|meq|%)\b"
+    r"(?!\s*(?:/|per)\s*(?:dl|l|ml|kg|m2|hr|h)\b)"
+)
 RATIO_STRENGTH_RE = re.compile(
     r"\b(\d+(?:\.\d+)?)\s*(?:[-/]|to|\s+)\s*(\d+(?:\.\d+)?)\s*(mg|mcg|g|ml|units?|meq|%)\b"
 )
 SINGLE_STRENGTH_RE = re.compile(r"\b(\d+(?:\.\d+)?)\s*(mg|mcg|g|ml|units?|meq|%)\b")
 SLASH_RATIO_RE = re.compile(r"\b(\d+(?:\.\d+)?)\s*/\s*(\d+(?:\.\d+)?)\b")
 BARE_NUMBER_RE = re.compile(r"\b\d+(?:\.\d+)?\b")
+
+CONFUSABLE_CHAR_MAP: Dict[str, str] = {
+    "∕": "/",
+    "／": "/",
+    "⁄": "/",
+    "÷": "/",
+    "ø": "o",
+    "Ø": "O",
+    "ð": "d",
+    "Ð": "D",
+    "ł": "l",
+    "Ł": "L",
+    "υ": "u",
+    "Υ": "U",
+    "α": "a",
+    "Α": "A",
+    "β": "b",
+    "Β": "B",
+    "ο": "o",
+    "Ο": "O",
+    "ρ": "p",
+    "Ρ": "P",
+    "е": "e",
+    "Е": "E",
+    "а": "a",
+    "А": "A",
+    "с": "c",
+    "С": "C",
+    "р": "p",
+    "Р": "P",
+    "х": "x",
+    "Х": "X",
+    "к": "k",
+    "К": "K",
+}
 
 CONTEXT_STOPWORDS: Set[str] = {
     "po",
@@ -103,6 +141,11 @@ NOISY_TOKEN_REPLACEMENTS: Dict[str, str] = {
     "traz": "trazodone",
     "glipzide": "glipizide",
     "inslin": "insulin",
+    "norepi": "norepinephrine",
+    "levophed": "norepinephrine",
+    "dex": "dexmedetomidine",
+    "vanc": "vancomycin",
+    "zosyn": "piperacillin tazobactam",
 }
 
 FORM_HINTS: Dict[str, Tuple[str, ...]] = {
@@ -142,7 +185,36 @@ NON_DRUG_EXACT_TERMS: Set[str] = {
     "pill",
     "sugar pill",
     "cholesterol",
+    "lactate",
 }
+
+DENSE_LINE_MED_TOKENS: Dict[str, str] = {
+    "dexmedetomidine": "dexmedetomidine",
+    "metoprolol": "metoprolol",
+    "lisinopril": "lisinopril",
+    "metformin": "metformin",
+    "glyburide": "glyburide",
+    "atorvastatin": "atorvastatin",
+    "rosuvastatin": "rosuvastatin",
+    "propofol": "propofol",
+    "fentanyl": "fentanyl",
+    "prednisone": "prednisone",
+    "heparin": "heparin",
+    "eliquis": "eliquis",
+    "apixaban": "apixaban",
+    "vanc": "vancomycin",
+    "vancomycin": "vancomycin",
+    "zosyn": "zosyn",
+    "norepi": "norepinephrine",
+    "dex": "dexmedetomidine",
+}
+
+DENSE_LINE_MED_RE = re.compile(
+    "|".join(
+        re.escape(token) for token in sorted(DENSE_LINE_MED_TOKENS.keys(), key=len, reverse=True)
+    ),
+    flags=re.IGNORECASE,
+)
 
 NON_DRUG_EXACT_TTYS: Set[str] = {
     "DF",
@@ -166,7 +238,6 @@ STRENGTH_UNIT_TOKENS: Set[str] = {
 }
 
 SEGMENT_SPLIT_PATTERNS: Tuple[str, ...] = (
-    r"\.",
     r"\?",
     r"!",
     r";",
@@ -330,6 +401,8 @@ def log(message: str) -> None:
 
 
 def normalize_text(value: str) -> str:
+    if value:
+        value = "".join(CONFUSABLE_CHAR_MAP.get(ch, ch) for ch in value)
     ascii_text = (
         unicodedata.normalize("NFKD", value).encode("ascii", "ignore").decode("ascii")
     )
@@ -735,6 +808,9 @@ def detect_mentions(
             if "\n" in span_text:
                 i += 1
                 continue
+            if n > 1 and not allow_multi_token_span(span_text):
+                i += 1
+                continue
             norm_span = normalize_text(span_text)
             if not norm_span:
                 i += 1
@@ -771,15 +847,8 @@ def detect_mentions(
             rows: List[Tuple[str, str]] = []
             matched_norm = norm_span
             for lookup_norm in lookup_norms:
-                if not lookup_norm or lookup_norm in NON_DRUG_EXACT_TERMS:
-                    continue
-                candidate_rows = conn.execute(
-                    "SELECT DISTINCT rxcui, tty FROM alias WHERE norm_text = ? LIMIT ?",
-                    (lookup_norm, max_exact_candidates),
-                ).fetchall()
+                candidate_rows = lookup_exact_alias_rows(conn, lookup_norm, max_exact_candidates)
                 if not candidate_rows:
-                    continue
-                if all((tty or "").upper() in NON_DRUG_EXACT_TTYS for _, tty in candidate_rows):
                     continue
                 rows = candidate_rows
                 matched_norm = lookup_norm
@@ -802,6 +871,54 @@ def detect_mentions(
                 }
             )
             i += n
+
+    for idx, (token_text, start, end) in enumerate(tokens):
+        if occupied[idx]:
+            continue
+        token_norm = normalize_noisy_text(token_text)
+        replacement = NOISY_TOKEN_REPLACEMENTS.get(token_norm)
+        if not replacement:
+            continue
+        replacement_norm = normalize_noisy_text(replacement)
+        rows = lookup_exact_alias_rows(conn, replacement_norm, max_exact_candidates)
+        mentions.append(
+            {
+                "text": token_text,
+                "norm_text": replacement_norm,
+                "start": start,
+                "end": end,
+                "exact_rxcuids": [row[0] for row in rows],
+                "exact_ttys": sorted({row[1] for row in rows if row[1]}),
+            }
+        )
+        occupied[idx] = True
+
+    if text:
+        line_mention_counts: Dict[Tuple[int, int], int] = defaultdict(int)
+        for mention in mentions:
+            bounds = get_line_bounds(text, int(mention["start"]), int(mention["end"]))
+            line_mention_counts[bounds] += 1
+
+        existing_spans: Set[Tuple[int, int]] = {
+            (int(mention["start"]), int(mention["end"])) for mention in mentions
+        }
+        for line_start, line_end, line_text in iter_line_spans(text):
+            if not should_scan_dense_line(line_text):
+                continue
+            if line_mention_counts.get((line_start, line_end), 0) >= 2:
+                continue
+            dense_mentions = extract_dense_line_mentions(
+                line_text=line_text,
+                line_start=line_start,
+                conn=conn,
+                max_exact_candidates=max_exact_candidates,
+            )
+            for dense in dense_mentions:
+                dense_span = (int(dense["start"]), int(dense["end"]))
+                if dense_span in existing_spans:
+                    continue
+                mentions.append(dense)
+                existing_spans.add(dense_span)
 
     mentions.sort(key=lambda item: int(item["start"]))
     if mentions:
@@ -840,6 +957,12 @@ def detect_mentions(
             line_stripped = line_raw.strip()
             if not line_stripped:
                 mention["mention_text"] = str(mention["text"])
+                mention["mention_start"] = int(mention["start"])
+                mention["mention_end"] = int(mention["end"])
+                continue
+
+            if mention.get("preserve_span_text"):
+                mention["mention_text"] = str(mention["text"]).strip()
                 mention["mention_start"] = int(mention["start"])
                 mention["mention_end"] = int(mention["end"])
                 continue
@@ -1219,6 +1342,26 @@ def parse_pipe_med_fields(text: str) -> Optional[Dict[str, str]]:
     }
 
 
+def parse_rxe_fields(text: str) -> Optional[Dict[str, str]]:
+    stripped = text.strip()
+    if not stripped.lower().startswith("rxe|"):
+        return None
+    parts = [part.strip() for part in stripped.split("|")]
+    if len(parts) < 3:
+        return None
+    payload = parts[-1]
+    payload_parts = [part.strip() for part in payload.split("^")]
+    if len(payload_parts) < 4:
+        return None
+    return {
+        "name_raw": payload_parts[0],
+        "strength_raw": payload_parts[1],
+        "route_norm": normalize_text(payload_parts[2]),
+        "schedule_norm": normalize_text(payload_parts[3]),
+        "status_norm": "",
+    }
+
+
 def has_explicit_combo_hint(raw_text: str, mention_norm: str) -> bool:
     if "+" in raw_text:
         return True
@@ -1232,6 +1375,100 @@ def has_explicit_combo_hint(raw_text: str, mention_norm: str) -> bool:
     if re.search(r"\b[a-z]{3,}\s*-\s*[a-z]{3,}\b", lowered):
         return True
     return False
+
+
+def lookup_exact_alias_rows(
+    conn: sqlite3.Connection, lookup_norm: str, max_exact_candidates: int
+) -> List[Tuple[str, str]]:
+    if not lookup_norm or lookup_norm in NON_DRUG_EXACT_TERMS:
+        return []
+    rows = conn.execute(
+        "SELECT DISTINCT rxcui, tty FROM alias WHERE norm_text = ? LIMIT ?",
+        (lookup_norm, max_exact_candidates),
+    ).fetchall()
+    if not rows:
+        return []
+    if all((tty or "").upper() in NON_DRUG_EXACT_TTYS for _, tty in rows):
+        return []
+    return rows
+
+
+def iter_line_spans(text: str) -> Iterable[Tuple[int, int, str]]:
+    offset = 0
+    for raw_line in text.splitlines(keepends=True):
+        line_text = raw_line.rstrip("\n")
+        start = offset
+        end = start + len(line_text)
+        yield start, end, line_text
+        offset += len(raw_line)
+    if text and not text.endswith("\n"):
+        return
+    if not text:
+        return
+    if text.endswith("\n"):
+        yield len(text), len(text), ""
+
+
+def should_scan_dense_line(line_text: str) -> bool:
+    stripped = line_text.strip()
+    if len(stripped) < 70:
+        return False
+    if len(stripped.split()) > 4:
+        return False
+    canonical = normalize_noisy_text(stripped)
+    if len(canonical) < 50:
+        return False
+    return len(list(DENSE_LINE_MED_RE.finditer(canonical))) >= 2
+
+
+def extract_dense_line_mentions(
+    line_text: str,
+    line_start: int,
+    conn: sqlite3.Connection,
+    max_exact_candidates: int,
+) -> List[Dict[str, object]]:
+    raw_canonical_line = "".join(CONFUSABLE_CHAR_MAP.get(ch, ch) for ch in line_text).lower()
+    matches = list(DENSE_LINE_MED_RE.finditer(raw_canonical_line))
+    if not matches:
+        return []
+    mentions: List[Dict[str, object]] = []
+    for idx, match in enumerate(matches):
+        seg_start = int(match.start())
+        seg_end = int(matches[idx + 1].start()) if idx + 1 < len(matches) else len(line_text)
+        segment = line_text[seg_start:seg_end].strip(" ,;")
+        if len(segment) < 3:
+            continue
+
+        normalized_segment = normalize_noisy_text(segment)
+        core_raw = DENSE_LINE_MED_TOKENS.get(match.group(0).lower(), match.group(0).lower())
+        core_norm = normalize_noisy_text(core_raw)
+        rows = lookup_exact_alias_rows(conn, core_norm, max_exact_candidates)
+        if not rows:
+            rows = lookup_exact_alias_rows(
+                conn, strip_context_tokens(normalized_segment), max_exact_candidates
+            )
+
+        mentions.append(
+            {
+                "text": segment,
+                "norm_text": normalized_segment or core_norm,
+                "start": line_start + seg_start,
+                "end": line_start + seg_start + len(segment),
+                "exact_rxcuids": [row[0] for row in rows],
+                "exact_ttys": sorted({row[1] for row in rows if row[1]}),
+                "preserve_span_text": True,
+            }
+        )
+    return mentions
+
+
+def allow_multi_token_span(span_text: str) -> bool:
+    lowered = span_text.lower()
+    if "," in span_text and not any(
+        marker in lowered for marker in (" and ", " with ", "/", "+")
+    ):
+        return False
+    return True
 
 
 def build_query_variants(raw_text: str, mention_text: str, mention_norm: str) -> List[str]:
@@ -1261,6 +1498,21 @@ def strength_signatures(text_norm: str) -> Set[str]:
     for value, unit in SINGLE_STRENGTH_RE.findall(working):
         add_strength_signature(signatures, value, unit)
     return signatures
+
+
+def has_surface_strength_signal(text_norm: str) -> bool:
+    if not text_norm:
+        return False
+    if STRENGTH_RE.search(text_norm):
+        return True
+    if RATIO_STRENGTH_RE.search(text_norm):
+        return True
+    if re.search(
+        r"\b\d+(?:\.\d+)?\s*(?:u|unit|units)\s*(?:/|\s+)\s*kg\s*(?:/|\s+)\s*h(?:r)?\b",
+        text_norm,
+    ):
+        return True
+    return False
 
 
 def candidate_form_flags(candidate_norm: str) -> Set[str]:
@@ -1317,7 +1569,9 @@ def extract_mention_features(
     strength_tokens = {m.group(0).strip() for m in STRENGTH_RE.finditer(context_norm)}
     strength_sigs = strength_signatures(context_norm)
     pipe_fields = parse_pipe_med_fields(mention_text)
-    structured_med_record = pipe_fields is not None
+    rxe_fields = parse_rxe_fields(mention_text)
+    structured_fields = pipe_fields or rxe_fields
+    structured_med_record = structured_fields is not None
     form_tokens: Set[str] = set()
     padded_norm = f" {context_norm} "
     for form_key, hints in FORM_HINTS.items():
@@ -1326,7 +1580,7 @@ def extract_mention_features(
                 form_tokens.add(form_key)
                 break
 
-    combo_probe_text = pipe_fields["name_raw"] if pipe_fields else mention_text
+    combo_probe_text = structured_fields["name_raw"] if structured_fields else mention_text
     combo_hint = has_explicit_combo_hint(combo_probe_text, mention_norm)
 
     iv_route_hint = bool(re.search(r"\b(?:iv|ivp|ivpb|intravenous)\b", context_norm))
@@ -1334,9 +1588,15 @@ def extract_mention_features(
     continuous_infusion_hint = bool(
         re.search(r"\b(?:gtt|drip|infusion|cont|continuous)\b", context_norm)
     )
-    if pipe_fields:
-        route_norm = pipe_fields["route_norm"]
-        schedule_norm = pipe_fields["schedule_norm"]
+    infusion_rate_hint = bool(
+        re.search(
+            r"\b(?:mcg|mg|u|unit|units)\s*(?:/|\s+)?\s*(?:kg\s*(?:/|\s+)?\s*h(?:r)?|kgh?r)\w*",
+            context_norm,
+        )
+    )
+    if structured_fields:
+        route_norm = structured_fields["route_norm"]
+        schedule_norm = structured_fields["schedule_norm"]
         if route_norm in IV_ROUTE_TOKENS:
             iv_route_hint = True
             form_tokens.add("injection")
@@ -1344,6 +1604,10 @@ def extract_mention_features(
             oral_route_hint = True
         if schedule_norm in {"cont", "continuous"}:
             continuous_infusion_hint = True
+    if infusion_rate_hint:
+        continuous_infusion_hint = True
+        iv_route_hint = True
+        form_tokens.add("injection")
 
     ratio_pairs: List[Tuple[float, float]] = []
     ascii_mention = (
@@ -1401,9 +1665,9 @@ def get_line_bounds(text: str, start: int, end: int) -> Tuple[int, int]:
 
 
 def clause_around_span(line_text: str, rel_start: int, rel_end: int) -> str:
-    left_candidates = [line_text.rfind(ch, 0, rel_start) for ch in ".;:!?"]
+    left_candidates = [line_text.rfind(ch, 0, rel_start) for ch in ".;:!?,"]
     left_bound = max(left_candidates) if left_candidates else -1
-    right_candidates = [line_text.find(ch, rel_end) for ch in ".;:!?"]
+    right_candidates = [line_text.find(ch, rel_end) for ch in ".;:!?,"]
     right_candidates = [pos for pos in right_candidates if pos >= 0]
     right_bound = min(right_candidates) if right_candidates else len(line_text)
     return line_text[left_bound + 1 : right_bound].strip()
@@ -1806,11 +2070,23 @@ def project_ttys(
     mention_features = extract_mention_features(
         mention_text, mention_norm, mention_context_norm
     )
+    mention_surface_norm = normalize_noisy_text(mention_text)
+    mention_surface_has_strength = has_surface_strength_signal(mention_surface_norm)
+    structured_med_record = bool(mention_features.get("structured_med_record", False))
+    start_ttys = concept_ttys.get(start_rxcui, {})
+    ingredient_anchor = "IN" in start_ttys
     anchor_ingredients = ingredient_set_for_rxcui(
         start_rxcui, conn, concept_ttys, ingredient_cache
     )
 
     for target_tty in TARGET_TTYS:
+        if (
+            target_tty in {"SCD", "SBD", "SCDC"}
+            and ingredient_anchor
+            and not mention_surface_has_strength
+            and not structured_med_record
+        ):
+            continue
         preferred_strengths_mg: Optional[List[float]] = None
         if target_tty == "SCD" and projected["SBD"] is not None:
             preferred_strengths_mg = extract_candidate_strengths_mg(
@@ -2015,6 +2291,36 @@ def infer_text_with_resources(
             continue
 
         best_rxcui, best_score = max(score_by_rxcui.items(), key=lambda item: item[1])
+        has_strength_signal = bool(
+            STRENGTH_RE.search(mention_context_norm)
+            or RATIO_STRENGTH_RE.search(mention_context_norm)
+            or SLASH_RATIO_RE.search(mention_context_norm)
+        )
+        if not has_strength_signal and exact_rxcuids:
+            for exact_rxcui in exact_rxcuids:
+                if "IN" in concept_ttys.get(exact_rxcui, {}):
+                    best_rxcui = exact_rxcui
+                    best_score = score_by_rxcui.get(exact_rxcui, best_score)
+                    break
+        if not has_strength_signal:
+            in_override_rxcui: Optional[str] = None
+            for lookup_norm in (
+                mention_norm,
+                projection_norm,
+                strip_context_tokens(mention_norm),
+            ):
+                if not lookup_norm:
+                    continue
+                row = conn.execute(
+                    "SELECT rxcui FROM alias WHERE norm_text = ? AND tty = 'IN' LIMIT 1",
+                    (lookup_norm,),
+                ).fetchone()
+                if row:
+                    in_override_rxcui = str(row[0])
+                    break
+            if in_override_rxcui:
+                best_rxcui = in_override_rxcui
+                best_score = score_by_rxcui.get(in_override_rxcui, best_score)
         best_tty_map = concept_ttys.get(best_rxcui, {})
         best_tty = choose_primary_tty(best_tty_map)
         projected = project_ttys(
