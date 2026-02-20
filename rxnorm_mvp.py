@@ -33,6 +33,10 @@ TARGET_TTYS: Tuple[str, ...] = (
 TTY_PRIORITY: Dict[str, int] = {tty: i for i, tty in enumerate(TARGET_TTYS)}
 TOKEN_RE = re.compile(r"[A-Za-z0-9]+(?:[+/%_-][A-Za-z0-9]+)*(?:\.[A-Za-z0-9]+)*")
 STRENGTH_RE = re.compile(r"\b\d+(?:\.\d+)?\s*(?:mg|mcg|g|ml|units?|meq|%)\b")
+RATIO_STRENGTH_RE = re.compile(
+    r"\b(\d+(?:\.\d+)?)\s*[-/]\s*(\d+(?:\.\d+)?)\s*(mg|mcg|g|ml|units?|meq|%)\b"
+)
+SINGLE_STRENGTH_RE = re.compile(r"\b(\d+(?:\.\d+)?)\s*(mg|mcg|g|ml|units?|meq|%)\b")
 
 FORM_HINTS: Dict[str, Tuple[str, ...]] = {
     "inhaler": ("inhaler", "inhalation", "hfa", "mdi", "actuat"),
@@ -776,10 +780,87 @@ def token_jaccard(a: str, b: str) -> float:
     return overlap / union if union else 0.0
 
 
+def canonical_unit(unit: str) -> str:
+    lowered = unit.lower()
+    if lowered.startswith("unit"):
+        return "unit"
+    return lowered
+
+
+def canonical_number(value: str) -> str:
+    try:
+        parsed = float(value)
+    except ValueError:
+        return value
+    if parsed.is_integer():
+        return str(int(parsed))
+    return f"{parsed:.6g}"
+
+
+def strength_signatures(text_norm: str) -> Set[str]:
+    signatures: Set[str] = set()
+    for first, second, unit in RATIO_STRENGTH_RE.findall(text_norm):
+        u = canonical_unit(unit)
+        signatures.add(f"{canonical_number(first)}{u}")
+        signatures.add(f"{canonical_number(second)}{u}")
+    for value, unit in SINGLE_STRENGTH_RE.findall(text_norm):
+        signatures.add(f"{canonical_number(value)}{canonical_unit(unit)}")
+    return signatures
+
+
+def candidate_form_flags(candidate_norm: str) -> Set[str]:
+    flags: Set[str] = set()
+    padded = f" {candidate_norm} "
+    for form_key, hints in FORM_HINTS.items():
+        for hint in hints:
+            if f" {hint} " in padded:
+                flags.add(form_key)
+                break
+    if " oral " in padded:
+        flags.add("oral")
+    return flags
+
+
+def find_segment_bounds(text: str, start: int, end: int, pattern: str) -> Tuple[int, int]:
+    left = 0
+    right = len(text)
+    for match in re.finditer(pattern, text, flags=re.IGNORECASE):
+        if match.end() <= start:
+            left = match.end()
+            continue
+        if match.start() >= end:
+            right = match.start()
+            break
+    return left, right
+
+
+def focused_context_around_match(full_text: str, match_start: int, match_end: int) -> str:
+    line_start, line_end = get_line_bounds(full_text, match_start, match_end)
+    line_text = full_text[line_start:line_end]
+    rel_start = max(0, match_start - line_start)
+    rel_end = max(rel_start, match_end - line_start)
+
+    seg_start = 0
+    seg_end = len(line_text)
+    for pattern in (r";", r"\band\b", r","):
+        local = line_text[seg_start:seg_end]
+        local_start = rel_start - seg_start
+        local_end = rel_end - seg_start
+        left, right = find_segment_bounds(local, local_start, local_end, pattern)
+        seg_start += left
+        seg_end = seg_start + (right - left)
+
+    focused = line_text[seg_start:seg_end].strip()
+    if len(focused) < 3:
+        return normalize_text(line_text.strip())
+    return normalize_text(focused)
+
+
 def extract_mention_features(
     mention_text: str, mention_norm: str, context_norm: str
 ) -> Dict[str, object]:
     strength_tokens = {m.group(0).strip() for m in STRENGTH_RE.finditer(context_norm)}
+    strength_sigs = strength_signatures(context_norm)
     form_tokens: Set[str] = set()
     padded_norm = f" {context_norm} "
     for form_key, hints in FORM_HINTS.items():
@@ -796,6 +877,7 @@ def extract_mention_features(
     )
     return {
         "strength_tokens": strength_tokens,
+        "strength_sigs": strength_sigs,
         "form_tokens": form_tokens,
         "combo_hint": combo_hint,
     }
@@ -981,27 +1063,57 @@ def score_tty_candidate(
     score -= 0.45 * float(depth)
 
     strength_tokens = mention_features["strength_tokens"]  # type: ignore[assignment]
+    strength_sigs = mention_features["strength_sigs"]  # type: ignore[assignment]
     form_tokens = mention_features["form_tokens"]  # type: ignore[assignment]
     combo_hint = bool(mention_features["combo_hint"])
 
     if isinstance(strength_tokens, set) and strength_tokens:
         matched = sum(1 for token in strength_tokens if token in candidate_norm)
         if matched > 0:
-            score += 1.6 * float(matched)
+            score += 1.8 * float(matched)
         else:
-            score -= 0.45
+            score -= 0.6
+
+    if isinstance(strength_sigs, set) and strength_sigs:
+        candidate_sigs = strength_signatures(candidate_norm)
+        if candidate_sigs:
+            overlap = len(strength_sigs & candidate_sigs)
+            if overlap > 0:
+                score += 2.2 * float(overlap)
+            else:
+                score -= 1.4
+        else:
+            score -= 0.8
 
     if isinstance(form_tokens, set) and form_tokens:
+        candidate_flags = candidate_form_flags(candidate_norm)
         matched_form = 0
         for form_key in form_tokens:
-            for hint in FORM_HINTS.get(str(form_key), ()):
-                if hint in candidate_norm:
-                    matched_form += 1
-                    break
+            if form_key in candidate_flags:
+                matched_form += 1
         if matched_form > 0:
-            score += 0.7 * float(matched_form)
+            score += 1.2 * float(matched_form)
         else:
-            score -= 0.25
+            score -= 0.9
+
+        if "inhaler" in form_tokens and (
+            "tablet" in candidate_flags
+            or "capsule" in candidate_flags
+            or "oral" in candidate_flags
+            or "injection" in candidate_flags
+        ):
+            score -= 2.4
+
+        if "injection" in form_tokens and (
+            "tablet" in candidate_flags
+            or "capsule" in candidate_flags
+            or "oral" in candidate_flags
+            or "inhaler" in candidate_flags
+        ):
+            score -= 2.4
+
+        if ("tablet" in form_tokens or "capsule" in form_tokens) and "inhaler" in candidate_flags:
+            score -= 2.0
 
     combo_allowed = combo_hint or len(anchor_ingredients) > 1
     if target_tty == "MIN" and not combo_allowed:
@@ -1171,11 +1283,17 @@ def cmd_infer(args: argparse.Namespace) -> int:
             match_end = int(mention["end"])
             line_start, line_end = get_line_bounds(input_text, mention_start, mention_end)
             line_context = input_text[line_start:line_end].strip()
-            if len(line_context) < 4:
+            focused_context_norm = focused_context_around_match(
+                input_text, match_start, match_end
+            )
+            if len(focused_context_norm) >= 3:
+                mention_context_norm = focused_context_norm
+            elif len(line_context) >= 4:
+                mention_context_norm = normalize_text(line_context)
+            else:
                 context_start = max(0, mention_start - 24)
                 context_end = min(len(input_text), mention_end + 40)
-                line_context = input_text[context_start:context_end]
-            mention_context_norm = normalize_text(line_context)
+                mention_context_norm = normalize_text(input_text[context_start:context_end])
             exact_rxcuids: List[str] = list(mention["exact_rxcuids"])  # type: ignore[assignment]
             exact_ttys: List[str] = list(mention.get("exact_ttys", []))  # type: ignore[assignment]
 
