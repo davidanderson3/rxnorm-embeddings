@@ -34,12 +34,12 @@ TTY_PRIORITY: Dict[str, int] = {tty: i for i, tty in enumerate(TARGET_TTYS)}
 TOKEN_RE = re.compile(r"[A-Za-z0-9]+(?:[+/%_-][A-Za-z0-9]+)*(?:\.[A-Za-z0-9]+)*")
 STRENGTH_RE = re.compile(r"\b\d+(?:\.\d+)?\s*(?:mg|mcg|g|ml|units?|meq|%)\b")
 RATIO_STRENGTH_RE = re.compile(
-    r"\b(\d+(?:\.\d+)?)\s*[-/]\s*(\d+(?:\.\d+)?)\s*(mg|mcg|g|ml|units?|meq|%)\b"
+    r"\b(\d+(?:\.\d+)?)\s*(?:[-/]|to|\s+)\s*(\d+(?:\.\d+)?)\s*(mg|mcg|g|ml|units?|meq|%)\b"
 )
 SINGLE_STRENGTH_RE = re.compile(r"\b(\d+(?:\.\d+)?)\s*(mg|mcg|g|ml|units?|meq|%)\b")
 
 FORM_HINTS: Dict[str, Tuple[str, ...]] = {
-    "inhaler": ("inhaler", "inhalation", "hfa", "mdi", "actuat"),
+    "inhaler": ("inhaler", "hfa", "mdi", "actuat", "metered dose", "aerosol", "spray"),
     "tablet": ("tablet", "tab", "oral tablet"),
     "capsule": ("capsule", "cap"),
     "solution": ("solution", "soln"),
@@ -1103,6 +1103,8 @@ def score_tty_candidate(
             or "injection" in candidate_flags
         ):
             score -= 2.4
+        if "inhaler" in form_tokens and "solution" in candidate_flags and "inhaler" not in candidate_flags:
+            score -= 1.8
 
         if "injection" in form_tokens and (
             "tablet" in candidate_flags
