@@ -1,0 +1,7 @@
+RxNorm_full_prescribe_current.zip
+artifacts
+RxNorm_full_prescribe_current
+__pycache__/
+*.py[cod]
+.pycache_local/
+

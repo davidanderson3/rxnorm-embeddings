@@ -1,0 +1,79 @@
+# RxNorm Embedding MVP
+
+This MVP takes free text, finds medication mentions, picks a best RxNorm concept, and projects to:
+
+- `SBD`
+- `SCD`
+- `GPCK`
+- `BPCK`
+- `BN`
+- `SCDC`
+- `IN`
+- `PIN`
+- `MIN`
+
+It uses:
+
+- exact alias matching from `RXNCONSO.RRF`
+- hashed character n-gram embeddings for semantic-ish retrieval
+- relation-constrained traversal over `RXNREL.RRF` for TTY projection
+- ingredient-aware filtering to avoid unrelated combination products
+- context-aware re-ranking (strength/form cues from nearby text)
+
+## Prereqs
+
+- Python 3.9+
+- `numpy`
+
+## Build index
+
+```sh
+python3 rxnorm_mvp.py build-index \
+  --rrf-dir RxNorm_full_prescribe_current/rrf \
+  --out-dir artifacts/rxnorm_mvp
+```
+
+Artifacts created:
+
+- `artifacts/rxnorm_mvp/rxnorm_index.sqlite`
+- `artifacts/rxnorm_mvp/concept_embeddings.npy`
+- `artifacts/rxnorm_mvp/concept_rxcuis.json`
+- `artifacts/rxnorm_mvp/metadata.json`
+
+## Run inference
+
+```sh
+python3 rxnorm_mvp.py infer \
+  --index-dir artifacts/rxnorm_mvp \
+  --text "Patient takes metformin 500 mg BID and lisinopril 10 mg daily."
+```
+
+Output is JSON with:
+
+- detected mention text and span
+- best match (`rxcui`, `name`, `tty`, score)
+- projected results for all target TTYs
+
+## Run the web interface
+
+```sh
+python3 rxnorm_web.py --index-dir artifacts/rxnorm_mvp --port 8000
+```
+
+Then open:
+
+```txt
+http://127.0.0.1:8000
+```
+
+## Quick smoke test (small subset)
+
+Use these flags to test quickly before full indexing:
+
+```sh
+python3 rxnorm_mvp.py build-index \
+  --rrf-dir RxNorm_full_prescribe_current/rrf \
+  --out-dir artifacts/rxnorm_mvp_smoke \
+  --max-concepts 5000 \
+  --max-rel-lines 200000
+```
