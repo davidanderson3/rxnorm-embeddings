@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import html
 import json
 import re
 import sqlite3
@@ -42,6 +43,7 @@ RATIO_STRENGTH_RE = re.compile(
 SINGLE_STRENGTH_RE = re.compile(r"\b(\d+(?:\.\d+)?)\s*(mg|mcg|g|ml|units?|meq|%)\b")
 SLASH_RATIO_RE = re.compile(r"\b(\d+(?:\.\d+)?)\s*/\s*(\d+(?:\.\d+)?)\b")
 BARE_NUMBER_RE = re.compile(r"\b\d+(?:\.\d+)?\b")
+XML_VALUE_ATTR_RE = re.compile(r"""value\s*=\s*(['"])(.*?)\1""", re.IGNORECASE)
 
 CONFUSABLE_CHAR_MAP: Dict[str, str] = {
     "∕": "/",
@@ -128,6 +130,8 @@ NOISY_TOKEN_REPLACEMENTS: Dict[str, str] = {
     "liptor": "lipitor",
     "atorvstatin": "atorvastatin",
     "atorvststin": "atorvastatin",
+    "carvadiol": "carvedilol",
+    "furosemid": "furosemide",
     "albterol": "albuterol",
     "albutrol": "albuterol",
     "amxclv": "amoxicillin clavulanate",
@@ -139,8 +143,10 @@ NOISY_TOKEN_REPLACEMENTS: Dict[str, str] = {
     "oxyapap": "acetaminophen oxycodone",
     "pred": "prednisone",
     "traz": "trazodone",
+    "trazadone": "trazodone",
     "glipzide": "glipizide",
     "inslin": "insulin",
+    "duoneb": "albuterol ipratropium",
     "norepi": "norepinephrine",
     "levophed": "norepinephrine",
     "dex": "dexmedetomidine",
@@ -186,6 +192,7 @@ NON_DRUG_EXACT_TERMS: Set[str] = {
     "sugar pill",
     "cholesterol",
     "lactate",
+    "water",
 }
 
 DENSE_LINE_MED_TOKENS: Dict[str, str] = {
@@ -956,13 +963,15 @@ def detect_mentions(
             line_raw = text[line_start:line_end]
             line_stripped = line_raw.strip()
             if not line_stripped:
-                mention["mention_text"] = str(mention["text"])
+                mention["mention_text"] = clean_mention_text_for_display(str(mention["text"]))
                 mention["mention_start"] = int(mention["start"])
                 mention["mention_end"] = int(mention["end"])
                 continue
 
             if mention.get("preserve_span_text"):
-                mention["mention_text"] = str(mention["text"]).strip()
+                mention["mention_text"] = clean_mention_text_for_display(
+                    str(mention["text"]).strip()
+                )
                 mention["mention_start"] = int(mention["start"])
                 mention["mention_end"] = int(mention["end"])
                 continue
@@ -973,13 +982,13 @@ def detect_mentions(
             if clause_text:
                 clause_pos = line_raw.find(clause_text)
                 if clause_pos >= 0:
-                    mention["mention_text"] = clause_text
+                    mention["mention_text"] = clean_mention_text_for_display(clause_text)
                     mention["mention_start"] = line_start + clause_pos
                     mention["mention_end"] = line_start + clause_pos + len(clause_text)
                     continue
 
             left_trim = len(line_raw) - len(line_raw.lstrip())
-            mention["mention_text"] = line_stripped
+            mention["mention_text"] = clean_mention_text_for_display(line_stripped)
             mention["mention_start"] = line_start + left_trim
             mention["mention_end"] = line_start + left_trim + len(line_stripped)
         return mentions
@@ -1000,7 +1009,7 @@ def detect_mentions(
                     "end": pos + len(chunk),
                     "exact_rxcuids": [],
                     "exact_ttys": [],
-                    "mention_text": chunk,
+                    "mention_text": clean_mention_text_for_display(chunk),
                     "mention_start": pos,
                     "mention_end": pos + len(chunk),
                 }
@@ -1017,7 +1026,7 @@ def detect_mentions(
             "end": len(stripped),
             "exact_rxcuids": [],
             "exact_ttys": [],
-            "mention_text": stripped,
+            "mention_text": clean_mention_text_for_display(stripped),
             "mention_start": 0,
             "mention_end": len(stripped),
         }
@@ -1685,6 +1694,38 @@ def clause_around_span(line_text: str, rel_start: int, rel_end: int) -> str:
     return line_text[left_bound + 1 : right_bound].strip()
 
 
+def clean_mention_text_for_display(text: str) -> str:
+    stripped = text.strip()
+    if "<" not in stripped or "value" not in stripped.lower():
+        return stripped
+
+    values: List[str] = []
+    for _quote, captured in XML_VALUE_ATTR_RE.findall(stripped):
+        value = html.unescape(captured).strip()
+        if value:
+            values.append(value)
+    if not values:
+        return stripped
+
+    generic_values = {"active", "order", "true", "false"}
+    meaningful: List[str] = []
+    for value in values:
+        lowered = value.lower()
+        if lowered in generic_values:
+            continue
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+            continue
+        if re.fullmatch(r"[a-z]+/\d+", lowered):
+            continue
+        if not any(ch.isalpha() for ch in value):
+            continue
+        meaningful.append(value)
+
+    if meaningful:
+        return max(meaningful, key=len)
+    return max(values, key=len)
+
+
 def is_negated_mention(
     full_text: str, span_start: int, span_end: int, mention_norm: str
 ) -> bool:
@@ -2217,6 +2258,11 @@ def project_ttys(
         if in_all:
             projected["IN_ALL"] = in_all
             projected["IN"] = list(in_all)
+    elif len(anchor_ingredients) > 1:
+        anchor_in_all = in_list_from_rxcui_set(anchor_ingredients, concept_ttys)
+        if anchor_in_all:
+            projected["IN_ALL"] = anchor_in_all
+            projected["IN"] = list(anchor_in_all)
 
     return projected
 
