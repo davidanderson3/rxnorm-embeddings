@@ -25,11 +25,8 @@ const runBtn = document.getElementById("runBtn");
 const clearBtn = document.getElementById("clearBtn");
 const inputText = document.getElementById("inputText");
 const statusEl = document.getElementById("status");
-const resultBody = document.getElementById("resultBody");
+const resultList = document.getElementById("resultList");
 const rawJson = document.getElementById("rawJson");
-const mentionCount = document.getElementById("mentionCount");
-const scdCount = document.getElementById("scdCount");
-const bnCount = document.getElementById("bnCount");
 
 let pyodidePromise = null;
 let enginePromise = null;
@@ -53,46 +50,103 @@ function cellValue(item) {
   return `${item.name} (${item.rxcui})`;
 }
 
+function pickBetterTTY(current, candidate) {
+  if (!current) return candidate || null;
+  if (!candidate) return current;
+  const currentDepth =
+    typeof current.depth === "number" ? current.depth : Number.POSITIVE_INFINITY;
+  const candidateDepth =
+    typeof candidate.depth === "number" ? candidate.depth : Number.POSITIVE_INFINITY;
+  if (candidateDepth < currentDepth) return candidate;
+  return current;
+}
+
+function mergeMentionRows(base, incoming) {
+  const merged = {
+    ...base,
+    tty_results: { ...(base.tty_results || {}) },
+  };
+  const incomingTTY = incoming.tty_results || {};
+  const ttyKeys = ["SBD", "SCD", "GPCK", "BPCK", "BN", "SCDC", "IN", "PIN", "MIN"];
+  for (const key of ttyKeys) {
+    merged.tty_results[key] = pickBetterTTY(
+      merged.tty_results[key] || null,
+      incomingTTY[key] || null,
+    );
+  }
+
+  const baseNorm = String(merged.normalized_text || "").trim();
+  const incomingNorm = String(incoming.normalized_text || "").trim();
+  if (incomingNorm && incomingNorm !== baseNorm) {
+    const parts = baseNorm
+      ? baseNorm.split(" | ").map((p) => p.trim()).filter(Boolean)
+      : [];
+    if (!parts.includes(incomingNorm)) {
+      parts.push(incomingNorm);
+    }
+    merged.normalized_text = parts.join(" | ");
+  }
+  return merged;
+}
+
+function dedupeMentionsForDisplay(mentions) {
+  const deduped = [];
+  const indexByKey = new Map();
+  for (const mention of mentions) {
+    const scdRxcui = mention.tty_results && mention.tty_results.SCD
+      ? String(mention.tty_results.SCD.rxcui || "")
+      : "";
+    const mentionKey = String(mention.mention_text || "").trim().toLowerCase();
+    if (!scdRxcui || !mentionKey) {
+      deduped.push(mention);
+      continue;
+    }
+
+    const key = `${mentionKey}::${scdRxcui}`;
+    const existingIdx = indexByKey.get(key);
+    if (existingIdx === undefined) {
+      indexByKey.set(key, deduped.length);
+      deduped.push(mention);
+      continue;
+    }
+
+    deduped[existingIdx] = mergeMentionRows(deduped[existingIdx], mention);
+  }
+  return deduped;
+}
+
+function ttyLine(label, item) {
+  return `<div class="tty-line"><span class="tty-label">${label}</span> ${escapeHtml(cellValue(item))}</div>`;
+}
+
 function renderResults(payload) {
   const mentions = payload.mentions || [];
-  if (!mentions.length) {
-    resultBody.innerHTML = `<tr><td colspan="5">No medication mentions mapped.</td></tr>`;
+  const displayMentions = dedupeMentionsForDisplay(mentions);
+  const ttyOrder = ["SCD", "SBD", "GPCK", "BPCK", "BN", "SCDC", "IN", "PIN", "MIN"];
+  if (!displayMentions.length) {
+    resultList.innerHTML = `<article class="result-item empty">No medication mentions mapped.</article>`;
   } else {
-    resultBody.innerHTML = mentions
+    resultList.innerHTML = displayMentions
       .map((m) => {
         const t = m.tty_results || {};
+        const ttyRows = ttyOrder.map((label) => ttyLine(label, t[label])).join("");
         return `
-          <tr>
-            <td>
-              <strong>${escapeHtml(m.mention_text || "")}</strong>
-              <small>${escapeHtml(m.normalized_text || "")}</small>
-            </td>
-            <td>${escapeHtml(cellValue(t.SCD))}</td>
-            <td>${escapeHtml(cellValue(t.SBD))}</td>
-            <td>${escapeHtml(cellValue(t.BN))}</td>
-            <td>${escapeHtml(cellValue(t.IN))}</td>
-          </tr>
+          <article class="result-item">
+            <strong>${escapeHtml(m.mention_text || "")}</strong>
+            <small>${escapeHtml(m.normalized_text || "")}</small>
+            <div class="tty-list">${ttyRows}</div>
+          </article>
         `;
       })
       .join("");
   }
 
-  mentionCount.textContent = String(mentions.length);
-  scdCount.textContent = String(
-    mentions.filter((m) => m.tty_results && m.tty_results.SCD).length,
-  );
-  bnCount.textContent = String(
-    mentions.filter((m) => m.tty_results && m.tty_results.BN).length,
-  );
   rawJson.textContent = JSON.stringify(payload, null, 2);
 }
 
 function clearOutput() {
-  resultBody.innerHTML = `<tr><td colspan="5">No results yet.</td></tr>`;
+  resultList.innerHTML = `<article class="result-item empty">No results yet.</article>`;
   rawJson.textContent = "{}";
-  mentionCount.textContent = "0";
-  scdCount.textContent = "0";
-  bnCount.textContent = "0";
   setStatus("Cleared.");
 }
 
@@ -147,6 +201,8 @@ async function getPyodide() {
 
 async function initializeEngine() {
   const py = await getPyodide();
+  setStatus("Loading Python packages...");
+  await py.loadPackage(["numpy", "sqlite3"]);
   py.FS.mkdirTree("/rxnorm");
   py.FS.mkdirTree("/rxnorm/index");
 
@@ -181,11 +237,13 @@ async function initializeEngine() {
   await py.runPythonAsync(`
 import importlib.util
 import json
+import sys
 import sqlite3
 import numpy as np
 
 _spec = importlib.util.spec_from_file_location("rxnorm_mvp", "/rxnorm/rxnorm_mvp.py")
 rxnorm_mvp = importlib.util.module_from_spec(_spec)
+sys.modules["rxnorm_mvp"] = rxnorm_mvp
 _spec.loader.exec_module(rxnorm_mvp)
 
 _WEB_CONN = sqlite3.connect("/rxnorm/index/rxnorm_index.sqlite")
@@ -197,6 +255,7 @@ _WEB_PREFERRED_NAMES = rxnorm_mvp.load_preferred_names(_WEB_CONN)
 _WEB_CANDIDATE_CACHE = {}
 _WEB_INGREDIENT_CACHE = {}
 `);
+  return py;
 }
 
 async function ensureEngine() {
@@ -243,6 +302,9 @@ async function runInference() {
   runBtn.disabled = true;
   try {
     const py = await ensureEngine();
+    if (!py || !py.globals) {
+      throw new Error("Inference engine failed to initialize.");
+    }
     setStatus("Running inference...");
     const payloadText = await runPythonInference(py, text);
     try {

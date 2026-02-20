@@ -56,6 +56,7 @@ CONTEXT_STOPWORDS: Set[str] = {
     "prn",
     "qod",
     "continue",
+    "med",
     "start",
     "meds",
     "medications",
@@ -65,6 +66,7 @@ CONTEXT_STOPWORDS: Set[str] = {
     "capsule",
     "tab",
     "cap",
+    "pill",
     "and",
     "with",
     "for",
@@ -91,10 +93,15 @@ NOISY_TOKEN_REPLACEMENTS: Dict[str, str] = {
     "amxclv": "amoxicillin clavulanate",
     "amoxclv": "amoxicillin clavulanate",
     "amoxclav": "amoxicillin clavulanate",
+    "hctz": "hydrochlorothiazide",
+    "asa": "aspirin",
+    "apap": "acetaminophen",
+    "oxyapap": "acetaminophen oxycodone",
 }
 
 FORM_HINTS: Dict[str, Tuple[str, ...]] = {
     "inhaler": ("inhaler", "hfa", "mdi", "actuat", "metered dose", "aerosol", "spray"),
+    "dry_powder": ("dry powder", "diskus"),
     "tablet": ("tablet", "tab", "oral tablet"),
     "capsule": ("capsule", "cap"),
     "solution": ("solution", "soln"),
@@ -109,6 +116,43 @@ FORM_HINTS: Dict[str, Tuple[str, ...]] = {
     "er": ("extended release", "er", "xr", "24 hr"),
     "ec": ("enteric", "ec"),
 }
+
+NON_DRUG_EXACT_TERMS: Set[str] = {
+    "pill",
+    "sugar pill",
+    "cholesterol",
+}
+
+NON_DRUG_EXACT_TTYS: Set[str] = {
+    "DF",
+    "DFG",
+    "SCDG",
+    "SBDG",
+    "SCDF",
+    "SBDF",
+}
+
+STRENGTH_UNIT_TOKENS: Set[str] = {
+    "mg",
+    "mcg",
+    "g",
+    "ml",
+    "unit",
+    "units",
+    "meq",
+    "pct",
+    "percent",
+}
+
+SEGMENT_SPLIT_PATTERNS: Tuple[str, ...] = (
+    r"\.",
+    r"\?",
+    r"!",
+    r";",
+    r":",
+    r"\bbut\b",
+    r"\bplus\b",
+)
 
 DIRECT_INGREDIENT_RELAS: Set[str] = {
     "has_ingredient",
@@ -668,10 +712,50 @@ def detect_mentions(
                 i += 1
                 continue
 
-            rows = conn.execute(
-                "SELECT DISTINCT rxcui, tty FROM alias WHERE norm_text = ? LIMIT ?",
-                (norm_span, max_exact_candidates),
-            ).fetchall()
+            if norm_span in NON_DRUG_EXACT_TERMS:
+                i += 1
+                continue
+
+            lookup_norms: List[str] = [norm_span]
+            noisy_norm = normalize_noisy_text(span_text)
+            if noisy_norm and noisy_norm not in lookup_norms:
+                lookup_norms.append(noisy_norm)
+            stripped_noisy = strip_context_tokens(noisy_norm)
+            if stripped_noisy and stripped_noisy not in lookup_norms:
+                lookup_norms.append(stripped_noisy)
+            for existing in list(lookup_norms):
+                alpha_tokens = [
+                    tok
+                    for tok in existing.split()
+                    if any(ch.isalpha() for ch in tok)
+                    and tok not in STRENGTH_UNIT_TOKENS
+                    and tok not in CONTEXT_STOPWORDS
+                ]
+                if alpha_tokens:
+                    alpha_only = " ".join(alpha_tokens)
+                    if alpha_only and alpha_only not in lookup_norms:
+                        lookup_norms.append(alpha_only)
+                if 2 <= len(alpha_tokens) <= 3:
+                    alpha_sorted = " ".join(sorted(alpha_tokens))
+                    if alpha_sorted and alpha_sorted not in lookup_norms:
+                        lookup_norms.append(alpha_sorted)
+
+            rows: List[Tuple[str, str]] = []
+            matched_norm = norm_span
+            for lookup_norm in lookup_norms:
+                if not lookup_norm or lookup_norm in NON_DRUG_EXACT_TERMS:
+                    continue
+                candidate_rows = conn.execute(
+                    "SELECT DISTINCT rxcui, tty FROM alias WHERE norm_text = ? LIMIT ?",
+                    (lookup_norm, max_exact_candidates),
+                ).fetchall()
+                if not candidate_rows:
+                    continue
+                if all((tty or "").upper() in NON_DRUG_EXACT_TTYS for _, tty in candidate_rows):
+                    continue
+                rows = candidate_rows
+                matched_norm = lookup_norm
+                break
             if not rows:
                 i += 1
                 continue
@@ -682,7 +766,7 @@ def detect_mentions(
             mentions.append(
                 {
                     "text": span_text,
-                    "norm_text": norm_span,
+                    "norm_text": matched_norm,
                     "start": start,
                     "end": end,
                     "exact_rxcuids": [row[0] for row in rows],
@@ -709,15 +793,13 @@ def detect_mentions(
             for i in indices:
                 span_start = int(mentions[i]["start"])
                 span_end = int(mentions[i]["end"])
-                ttys = set(mentions[i].get("exact_ttys", []))  # type: ignore[arg-type]
                 in_parens = (
                     0 < span_start < len(text)
                     and 0 <= span_end < len(text)
                     and text[span_start - 1] in "(["
                     and text[span_end] in ")]"
                 )
-                is_brandish = bool(ttys & {"BN", "SBD", "BPCK", "SBDC", "SBDF"})
-                if in_parens or is_brandish:
+                if in_parens:
                     drop_indices.add(i)
 
         if drop_indices:
@@ -733,6 +815,17 @@ def detect_mentions(
                 mention["mention_start"] = int(mention["start"])
                 mention["mention_end"] = int(mention["end"])
                 continue
+
+            rel_start = max(0, int(mention["start"]) - line_start)
+            rel_end = max(rel_start, int(mention["end"]) - line_start)
+            clause_text = clause_around_span(line_raw, rel_start, rel_end).strip()
+            if clause_text:
+                clause_pos = line_raw.find(clause_text)
+                if clause_pos >= 0:
+                    mention["mention_text"] = clause_text
+                    mention["mention_start"] = line_start + clause_pos
+                    mention["mention_end"] = line_start + clause_pos + len(clause_text)
+                    continue
 
             left_trim = len(line_raw) - len(line_raw.lstrip())
             mention["mention_text"] = line_stripped
@@ -1027,7 +1120,7 @@ def focused_context_around_match(full_text: str, match_start: int, match_end: in
 
     seg_start = 0
     seg_end = len(line_text)
-    for pattern in (r";", r"\band\b", r","):
+    for pattern in SEGMENT_SPLIT_PATTERNS:
         local = line_text[seg_start:seg_end]
         local_start = rel_start - seg_start
         local_end = rel_end - seg_start
@@ -1294,6 +1387,8 @@ def score_tty_candidate(
             score -= 3.2
         if "inhaler" in form_tokens and "solution" in candidate_flags and "inhaler" not in candidate_flags:
             score -= 2.2
+        if "dry_powder" in form_tokens and "dry_powder" in candidate_flags:
+            score += 0.8
 
         if "injection" in form_tokens and (
             "tablet" in candidate_flags
@@ -1305,6 +1400,11 @@ def score_tty_candidate(
 
         if ("tablet" in form_tokens or "capsule" in form_tokens) and "inhaler" in candidate_flags:
             score -= 2.0
+
+    if "dry powder" in candidate_norm and not (
+        isinstance(form_tokens, set) and "dry_powder" in form_tokens
+    ):
+        score -= 1.8
 
     candidate_flags = candidate_form_flags(candidate_norm)
     if "solution" in candidate_flags and not (
@@ -1324,15 +1424,22 @@ def score_tty_candidate(
             elif candidate_ingredients.issuperset(anchor_ingredients):
                 score += 0.3
                 if not combo_allowed:
-                    score -= 2.6
+                    score -= 4.0
             elif candidate_ingredients & anchor_ingredients:
                 score += 0.1
                 if not combo_allowed and len(candidate_ingredients) > len(anchor_ingredients):
-                    score -= 2.4
+                    score -= 3.2
             else:
                 score -= 3.0
         else:
             score -= 0.4
+
+        if candidate_ingredients and len(candidate_ingredients) > len(anchor_ingredients):
+            extra_count = len(candidate_ingredients) - len(anchor_ingredients)
+            score -= 1.6 * float(extra_count)
+
+        if not combo_allowed and len(candidate_ingredients) > len(anchor_ingredients):
+            score -= 2.0
 
     if not combo_allowed and "/" in candidate_norm and target_tty in {
         "SBD",
@@ -1342,7 +1449,7 @@ def score_tty_candidate(
         "GPCK",
         "BPCK",
     }:
-        score -= 2.0
+        score -= 3.0
 
     if target_tty in {"GPCK", "BPCK"} and " pack " not in f" {candidate_norm} ":
         score -= 1.0
