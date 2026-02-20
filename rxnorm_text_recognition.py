@@ -14,6 +14,7 @@ import unicodedata
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
@@ -827,14 +828,23 @@ def detect_mentions(
                 i += 1
                 continue
 
-            lookup_norms: List[str] = [norm_span]
+            lookup_norms: List[Tuple[str, str]] = []
+            lookup_seen: Set[str] = set()
+
+            def add_lookup(value: str, source: str) -> None:
+                if not value:
+                    return
+                if value in lookup_seen:
+                    return
+                lookup_seen.add(value)
+                lookup_norms.append((value, source))
+
+            add_lookup(norm_span, "surface_norm")
             noisy_norm = normalize_noisy_text(span_text)
-            if noisy_norm and noisy_norm not in lookup_norms:
-                lookup_norms.append(noisy_norm)
+            add_lookup(noisy_norm, "noisy_norm")
             stripped_noisy = strip_context_tokens(noisy_norm)
-            if stripped_noisy and stripped_noisy not in lookup_norms:
-                lookup_norms.append(stripped_noisy)
-            for existing in list(lookup_norms):
+            add_lookup(stripped_noisy, "stripped_noisy_norm")
+            for existing, source in list(lookup_norms):
                 alpha_tokens = [
                     tok
                     for tok in existing.split()
@@ -844,21 +854,21 @@ def detect_mentions(
                 ]
                 if alpha_tokens:
                     alpha_only = " ".join(alpha_tokens)
-                    if alpha_only and alpha_only not in lookup_norms:
-                        lookup_norms.append(alpha_only)
+                    add_lookup(alpha_only, f"{source}:alpha_only")
                 if 2 <= len(alpha_tokens) <= 3:
                     alpha_sorted = " ".join(sorted(alpha_tokens))
-                    if alpha_sorted and alpha_sorted not in lookup_norms:
-                        lookup_norms.append(alpha_sorted)
+                    add_lookup(alpha_sorted, f"{source}:alpha_sorted")
 
             rows: List[Tuple[str, str]] = []
             matched_norm = norm_span
-            for lookup_norm in lookup_norms:
+            matched_source = "surface_norm"
+            for lookup_norm, lookup_source in lookup_norms:
                 candidate_rows = lookup_exact_alias_rows(conn, lookup_norm, max_exact_candidates)
                 if not candidate_rows:
                     continue
                 rows = candidate_rows
                 matched_norm = lookup_norm
+                matched_source = lookup_source
                 break
             if not rows:
                 i += 1
@@ -875,6 +885,9 @@ def detect_mentions(
                     "end": end,
                     "exact_rxcuids": [row[0] for row in rows],
                     "exact_ttys": sorted({row[1] for row in rows if row[1]}),
+                    "detection_method": "exact_alias_span",
+                    "lookup_norm": matched_norm,
+                    "lookup_source": matched_source,
                 }
             )
             i += n
@@ -896,6 +909,11 @@ def detect_mentions(
                 "end": end,
                 "exact_rxcuids": [row[0] for row in rows],
                 "exact_ttys": sorted({row[1] for row in rows if row[1]}),
+                "detection_method": "token_replacement_alias",
+                "lookup_norm": replacement_norm,
+                "lookup_source": "token_replacement",
+                "token_replacement_from": token_norm,
+                "token_replacement_to": replacement_norm,
             }
         )
         occupied[idx] = True
@@ -1009,6 +1027,9 @@ def detect_mentions(
                     "end": pos + len(chunk),
                     "exact_rxcuids": [],
                     "exact_ttys": [],
+                    "detection_method": "fallback_chunk",
+                    "lookup_norm": normalize_text(chunk),
+                    "lookup_source": "fallback_chunk",
                     "mention_text": clean_mention_text_for_display(chunk),
                     "mention_start": pos,
                     "mention_end": pos + len(chunk),
@@ -1026,6 +1047,9 @@ def detect_mentions(
             "end": len(stripped),
             "exact_rxcuids": [],
             "exact_ttys": [],
+            "detection_method": "fallback_whole_text",
+            "lookup_norm": normalize_text(stripped),
+            "lookup_source": "fallback_whole_text",
             "mention_text": clean_mention_text_for_display(stripped),
             "mention_start": 0,
             "mention_end": len(stripped),
@@ -1104,6 +1128,14 @@ def token_jaccard(a: str, b: str) -> float:
     overlap = len(a_tokens & b_tokens)
     union = len(a_tokens | b_tokens)
     return overlap / union if union else 0.0
+
+
+def normalized_char_similarity(a: str, b: str) -> float:
+    a_norm = re.sub(r"\s+", "", normalize_noisy_text(a))
+    b_norm = re.sub(r"\s+", "", normalize_noisy_text(b))
+    if not a_norm or not b_norm:
+        return 0.0
+    return float(SequenceMatcher(None, a_norm, b_norm).ratio())
 
 
 def canonical_unit(unit: str) -> str:
@@ -1464,10 +1496,14 @@ def extract_dense_line_mentions(
         core_raw = DENSE_LINE_MED_TOKENS.get(match.group(0).lower(), match.group(0).lower())
         core_norm = normalize_noisy_text(core_raw)
         rows = lookup_exact_alias_rows(conn, core_norm, max_exact_candidates)
+        lookup_source = "dense_core_norm"
+        lookup_norm = core_norm
         if not rows:
             rows = lookup_exact_alias_rows(
                 conn, strip_context_tokens(normalized_segment), max_exact_candidates
             )
+            lookup_source = "dense_segment_norm"
+            lookup_norm = strip_context_tokens(normalized_segment)
 
         mentions.append(
             {
@@ -1478,6 +1514,10 @@ def extract_dense_line_mentions(
                 "exact_rxcuids": [row[0] for row in rows],
                 "exact_ttys": sorted({row[1] for row in rows if row[1]}),
                 "preserve_span_text": True,
+                "detection_method": "dense_line_scan",
+                "lookup_norm": lookup_norm,
+                "lookup_source": lookup_source,
+                "dense_core_norm": core_norm,
             }
         )
     return mentions
@@ -2349,6 +2389,9 @@ def infer_text_with_resources(
         mention_text = str(mention.get("mention_text", mention["text"]))
         mention_norm = str(mention["norm_text"])
         matched_text = str(mention["text"])
+        mention_detection_method = str(mention.get("detection_method", "unknown"))
+        lookup_source = str(mention.get("lookup_source", ""))
+        lookup_norm_used = str(mention.get("lookup_norm", mention_norm))
         projection_norm = strip_context_tokens(normalize_noisy_text(matched_text))
         if not projection_norm:
             projection_norm = mention_norm
@@ -2381,6 +2424,7 @@ def infer_text_with_resources(
             continue
 
         score_by_rxcui: Dict[str, float] = {}
+        embedding_queries_used: List[str] = []
         query_variants = build_query_variants(
             raw_text=matched_text,
             mention_text=mention_text,
@@ -2388,12 +2432,15 @@ def infer_text_with_resources(
         )
         for query in query_variants:
             query_penalty = 0.0 if query == mention_norm else 0.03
-            for rxcui, score in top_embedding_candidates(
+            query_candidates = top_embedding_candidates(
                 mention_norm=query,
                 embeddings=embeddings,
                 rxcui_order=rxcui_order,
                 top_k=top_k,
-            ):
+            )
+            if query_candidates:
+                embedding_queries_used.append(query)
+            for rxcui, score in query_candidates:
                 adjusted = score - query_penalty
                 current = score_by_rxcui.get(rxcui)
                 if current is None or adjusted > current:
@@ -2405,7 +2452,35 @@ def infer_text_with_resources(
         if not score_by_rxcui:
             continue
 
+        detected_by: List[str] = []
+
+        def add_signal(signal: str) -> None:
+            if signal and signal not in detected_by:
+                detected_by.append(signal)
+
+        if mention_detection_method == "exact_alias_span":
+            add_signal("exact_alias")
+        elif mention_detection_method == "token_replacement_alias":
+            add_signal("token_replacement")
+            add_signal("exact_alias")
+        elif mention_detection_method == "dense_line_scan":
+            add_signal("dense_line_parser")
+            if exact_rxcuids:
+                add_signal("exact_alias")
+        elif mention_detection_method == "fallback_chunk":
+            add_signal("fallback_chunk")
+        elif mention_detection_method == "fallback_whole_text":
+            add_signal("fallback_whole_text")
+
+        if embedding_queries_used:
+            add_signal("embeddings")
+        if exact_rxcuids:
+            add_signal("exact_alias_boost")
+
         best_rxcui, best_score = max(score_by_rxcui.items(), key=lambda item: item[1])
+        selection_reason = "embedding_ranked"
+        in_exact_override_used = False
+        in_alias_override_used = False
         has_strength_signal = bool(
             STRENGTH_RE.search(mention_context_norm)
             or RATIO_STRENGTH_RE.search(mention_context_norm)
@@ -2414,6 +2489,9 @@ def infer_text_with_resources(
         if not has_strength_signal and exact_rxcuids:
             for exact_rxcui in exact_rxcuids:
                 if "IN" in concept_ttys.get(exact_rxcui, {}):
+                    if best_rxcui != exact_rxcui:
+                        in_exact_override_used = True
+                        selection_reason = "no_strength_in_exact_override"
                     best_rxcui = exact_rxcui
                     best_score = score_by_rxcui.get(exact_rxcui, best_score)
                     break
@@ -2434,8 +2512,17 @@ def infer_text_with_resources(
                     in_override_rxcui = str(row[0])
                     break
             if in_override_rxcui:
+                if best_rxcui != in_override_rxcui:
+                    in_alias_override_used = True
+                    selection_reason = "no_strength_in_alias_override"
                 best_rxcui = in_override_rxcui
                 best_score = score_by_rxcui.get(in_override_rxcui, best_score)
+        if best_rxcui in exact_rxcuids and selection_reason == "embedding_ranked":
+            selection_reason = "embedding_plus_exact"
+        if in_exact_override_used:
+            add_signal("no_strength_in_exact_override")
+        if in_alias_override_used:
+            add_signal("no_strength_in_alias_override")
         best_tty_map = concept_ttys.get(best_rxcui, {})
         best_tty = choose_primary_tty(best_tty_map)
         projected = project_ttys(
@@ -2460,6 +2547,53 @@ def infer_text_with_resources(
             projected["SBD"] = None
             projected["BPCK"] = None
 
+        ingredient_projection_suppressed = False
+        embedding_only_fallback = (
+            not exact_rxcuids
+            and mention_detection_method in {"fallback_whole_text", "fallback_chunk"}
+            and bool(embedding_queries_used)
+        )
+        best_name_for_similarity = preferred_names.get(best_rxcui, "")
+        best_name_similarity = normalized_char_similarity(mention_norm, best_name_for_similarity)
+        low_confidence_embedding_match = (
+            embedding_only_fallback
+            and best_tty != "IN"
+            and float(best_score) < 0.75
+            and best_name_similarity < 0.86
+        )
+        if low_confidence_embedding_match:
+            ingredient_projection_suppressed = True
+            for tty in TARGET_TTYS:
+                projected[tty] = None
+            projected.pop("IN_ALL", None)
+            add_signal("ingredient_projection_suppressed")
+            add_signal("low_confidence_embedding_match")
+            selection_reason = "low_confidence_embedding_suppressed"
+
+        detection_trace = {
+            "mention_detection_method": mention_detection_method,
+            "lookup_source": lookup_source,
+            "lookup_norm": lookup_norm_used,
+            "token_replacement": (
+                {
+                    "from": mention.get("token_replacement_from", ""),
+                    "to": mention.get("token_replacement_to", ""),
+                }
+                if mention_detection_method == "token_replacement_alias"
+                else None
+            ),
+            "ranking": {
+                "used_embeddings": bool(embedding_queries_used),
+                "embedding_query_variants": embedding_queries_used,
+                "exact_alias_candidate_count": len(exact_rxcuids),
+                "exact_alias_candidates": exact_rxcuids,
+                "exact_alias_ttys": exact_ttys,
+                "selection_reason": selection_reason,
+                "best_name_similarity": round(float(best_name_similarity), 6),
+                "ingredient_projection_suppressed": ingredient_projection_suppressed,
+            },
+        }
+
         results.append(
             {
                 "mention_text": mention_text,
@@ -2481,6 +2615,8 @@ def infer_text_with_resources(
                     "exact_match": best_rxcui in exact_rxcuids,
                 },
                 "tty_results": projected,
+                "detected_by": detected_by,
+                "detection_trace": detection_trace,
             }
         )
 

@@ -167,7 +167,7 @@ function renderResults(payload) {
   const displayMentions = dedupeMentionsForDisplay(mentions);
   const ttyOrder = ["SCD", "SBD", "GPCK", "BPCK", "BN", "SCDC", "IN", "PIN", "MIN"];
   if (!displayMentions.length) {
-    resultList.innerHTML = `<article class="result-item empty">No medication mentions mapped.</article>`;
+    resultList.innerHTML = `<article class="result-item empty">No match.</article>`;
   } else {
     resultList.innerHTML = displayMentions
       .map((m) => {
@@ -182,7 +182,9 @@ function renderResults(payload) {
           })
           .filter(Boolean)
           .join("");
-        const ttySection = ttyRows ? `<div class="tty-list">${ttyRows}</div>` : "";
+        const ttySection = ttyRows
+          ? `<div class="tty-list">${ttyRows}</div>`
+          : `<div class="tty-list"><div class="tty-line">No match.</div></div>`;
         return `
           <article class="result-item">
             <strong>${escapeHtml(m.mention_text || "")}</strong>
