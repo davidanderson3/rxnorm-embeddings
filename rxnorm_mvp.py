@@ -38,6 +38,51 @@ RATIO_STRENGTH_RE = re.compile(
 )
 SINGLE_STRENGTH_RE = re.compile(r"\b(\d+(?:\.\d+)?)\s*(mg|mcg|g|ml|units?|meq|%)\b")
 
+CONTEXT_STOPWORDS: Set[str] = {
+    "po",
+    "oral",
+    "iv",
+    "im",
+    "sq",
+    "sc",
+    "subcutaneous",
+    "daily",
+    "nightly",
+    "bid",
+    "tid",
+    "qid",
+    "qd",
+    "qhs",
+    "prn",
+    "qod",
+    "continue",
+    "start",
+    "meds",
+    "medications",
+    "take",
+    "takes",
+    "tablet",
+    "capsule",
+    "tab",
+    "cap",
+    "and",
+    "with",
+    "for",
+    "x7d",
+    "x10d",
+}
+
+NOISY_TOKEN_REPLACEMENTS: Dict[str, str] = {
+    "liptor": "lipitor",
+    "atorvstatin": "atorvastatin",
+    "atorvststin": "atorvastatin",
+    "albterol": "albuterol",
+    "albutrol": "albuterol",
+    "amxclv": "amoxicillin clavulanate",
+    "amoxclv": "amoxicillin clavulanate",
+    "amoxclav": "amoxicillin clavulanate",
+}
+
 FORM_HINTS: Dict[str, Tuple[str, ...]] = {
     "inhaler": ("inhaler", "hfa", "mdi", "actuat", "metered dose", "aerosol", "spray"),
     "tablet": ("tablet", "tab", "oral tablet"),
@@ -795,6 +840,97 @@ def canonical_number(value: str) -> str:
     if parsed.is_integer():
         return str(int(parsed))
     return f"{parsed:.6g}"
+
+
+def collapse_spelled_letters(text: str) -> str:
+    tokens = text.split()
+    if not tokens:
+        return text
+    merged: List[str] = []
+    i = 0
+    while i < len(tokens):
+        if len(tokens[i]) == 1 and tokens[i].isalpha():
+            j = i
+            while j < len(tokens) and len(tokens[j]) == 1 and tokens[j].isalpha():
+                j += 1
+            if j - i >= 3:
+                merged.append("".join(tokens[i:j]))
+            else:
+                merged.extend(tokens[i:j])
+            i = j
+            continue
+        merged.append(tokens[i])
+        i += 1
+    return " ".join(merged)
+
+
+def normalize_noisy_text(value: str) -> str:
+    base = normalize_text(value)
+    if not base:
+        return base
+    base = collapse_spelled_letters(base)
+    base = re.sub(r"\b(\d+)\s*m\s*g\b", r"\1 mg", base)
+    base = re.sub(r"\b(\d+)\s*m\s*c\s*g\b", r"\1 mcg", base)
+    base = re.sub(r"\b(\d+)\s*m\s*l\b", r"\1 ml", base)
+
+    tokens = base.split()
+    repaired: List[str] = []
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        if re.fullmatch(r"[0-9o]+(?:mg|mcg|g|ml|units?|meq|%)?", tok):
+            tok = tok.replace("o", "0")
+        replacement = NOISY_TOKEN_REPLACEMENTS.get(tok)
+        if replacement:
+            repaired.extend(replacement.split())
+            i += 1
+            continue
+
+        if i + 1 < len(tokens):
+            nxt = tokens[i + 1]
+            if (
+                tok.isalpha()
+                and nxt.isalpha()
+                and tok not in CONTEXT_STOPWORDS
+                and nxt not in CONTEXT_STOPWORDS
+                and 2 <= len(tok) <= 6
+                and 2 <= len(nxt) <= 8
+            ):
+                joined = tok + nxt
+                if joined in NOISY_TOKEN_REPLACEMENTS:
+                    repaired.extend(NOISY_TOKEN_REPLACEMENTS[joined].split())
+                    i += 2
+                    continue
+                if len(joined) >= 7:
+                    repaired.append(joined)
+                    i += 2
+                    continue
+
+        repaired.append(tok)
+        i += 1
+
+    return " ".join(repaired)
+
+
+def strip_context_tokens(text_norm: str) -> str:
+    tokens = [tok for tok in text_norm.split() if tok not in CONTEXT_STOPWORDS]
+    return " ".join(tokens)
+
+
+def build_query_variants(raw_text: str, mention_text: str, mention_norm: str) -> List[str]:
+    variants: List[str] = []
+
+    def add_variant(value: str) -> None:
+        cleaned = re.sub(r"\s+", " ", value).strip()
+        if cleaned and cleaned not in variants:
+            variants.append(cleaned)
+
+    add_variant(mention_norm)
+    add_variant(normalize_noisy_text(raw_text))
+    add_variant(normalize_noisy_text(mention_text))
+    for item in list(variants):
+        add_variant(strip_context_tokens(item))
+    return variants
 
 
 def strength_signatures(text_norm: str) -> Set[str]:
